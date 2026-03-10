@@ -1,72 +1,62 @@
+# -*- coding: utf-8 -*-
 import streamlit as st
 import pandas as pd
+import numpy as np
 import json
+import re
 import plotly.express as px
+from datetime import datetime
 
-# Настройка стиля RelocationTR
-st.set_page_config(page_title="RelocationTR Lead Sandbox", layout="wide")
+# --- НАСТРОЙКИ И МАППИНГИ ---
+WD_MAP = {0: "Пн", 1: "Вт", 2: "Ср", 3: "Чт", 4: "Пт", 5: "Сб", 6: "Вс"}
 
-st.sidebar.image("https://relocationtr.com/wp-content/uploads/2023/06/logo.png", width=200) # Лого с сайта
-st.sidebar.title("⚙️ Настройки поиска")
+st.set_page_config(page_title="RelocationTR | Lead Intelligence", layout="wide")
 
-# Интерактивные настройки для коллег
-st.sidebar.markdown("### Плюс-слова")
-plus_input = st.sidebar.text_area("Искать эти слова (через запятую):", 
-    "открыть ип, счет без депозита, регистрация компании, бухгалтер, юрист, текнокент")
-
-st.sidebar.markdown("### Минус-слова")
-minus_input = st.sidebar.text_area("Игнорировать эти слова:", 
-    "семинар, вебинар, ищу работу, вакансия, под ключ")
-
-# Превращаем текст в списки
-PLUS_WORDS = [x.strip().lower() for x in plus_input.split(",")]
-MINUS_WORDS = [x.strip().lower() for x in minus_input.split(",")]
-
-st.title("🛡️ Песочница Лидогенерации")
-st.info("Коллеги, загрузите JSON-экспорт чата и настройте фильтры слева, чтобы увидеть потенциал канала.")
-
-uploaded_file = st.file_uploader("Шаг 1: Перетащите сюда result.json", type="json")
-
-if uploaded_file:
-    data = json.load(uploaded_file)
+# --- ЛОГИКА ОБРАБОТКИ ДАННЫХ ---
+def process_telegram_json(data):
     messages = data.get('messages', [])
+    rows = []
+    for m in messages:
+        if m.get('type') != 'message' or not m.get('text'):
+            continue
+        
+        # Сборка текста (Телеграм иногда дробит его на объекты)
+        raw = m['text']
+        txt = "".join([p if isinstance(p, str) else p.get('text', '') for p in raw])
+        
+        dt = pd.to_datetime(m.get('date'), errors='coerce')
+        if pd.isna(dt): continue
+
+        rows.append({
+            "date": dt,
+            "user": m.get('from', 'Скрытый пользователь'),
+            "message": txt,
+            "hour": dt.hour,
+            "weekday": dt.weekday(),
+            "weekday_name": WD_MAP[dt.weekday()]
+        })
+    return pd.DataFrame(rows)
+
+def enrich_data(df):
+    text = df["message"].str.lower()
+    # Базовые фичи контента
+    df["char_len"] = text.str.len()
+    df["word_cnt"] = text.str.split().apply(lambda x: len(x) if isinstance(x, list) else 0)
+    df["question_cnt"] = text.str.count(r"\?")
+    df["has_link"] = text.str.contains(r"http|t\.me|@").astype(int)
     
-    leads = []
-    for msg in messages:
-        if msg.get('type') != 'message' or not msg.get('text'): continue
-        
-        # Сборка текста сообщения
-        raw_text = msg['text']
-        text = "".join([p if isinstance(p, str) else p.get('text', '') for p in raw_text])
-        text_l = text.lower()
-        
-        # Логика фильтрации
-        if any(m in text_l for m in MINUS_WORDS): continue
-        
-        matched = [p for p in PLUS_WORDS if p in text_l]
-        if matched:
-            leads.append({
-                "Дата": pd.to_datetime(msg.get('date')),
-                "Кто писал": msg.get('from', 'Скрыт'),
-                "Слова-триггеры": ", ".join(matched),
-                "Сообщение": text
-            })
-
-    df = pd.DataFrame(leads)
-
-    if not df.empty:
-        st.success(f"📈 Найдено {len(df)} потенциальных лидов!")
-        
-        # График для презентации
-        df['Месяц'] = df['Дата'].dt.to_period('M').astype(str)
-        fig = px.bar(df.groupby('Месяц').size().reset_index(name='Кол-во'), 
-                     x='Месяц', y='Кол-во', title="Активность запросов по времени")
-        st.plotly_chart(fig, use_container_width=True)
-
-        # Таблица
-        st.dataframe(df.sort_values("Дата", ascending=False), use_container_width=True)
-        
-        # Кнопка экспорта
-        st.download_button("📊 Скачать результат для CRM", df.to_csv(index=False).encode('utf-8-sig'), "leads.csv")
-    else:
-        st.warning("С такими настройками лидов не найдено. Попробуйте упростить ключевые слова.")
+    # --- УМНЫЕ ТЕГИ (SMART INTERSECTION) ---
+    topics = {
+        "🏦 Банки": (['счет', 'банк', 'iban', 'swift', 'депозит', 'карту'], ['открыть', 'нерезидент', 'без внж', 'бизнес', 'deniz', 'vakif', 'ziraat']),
+        "🏢 Регистрация": (['открыть', 'регистрац', 'оформить', 'создать'], ['ип', 'ооо', 'компани', 'бизнес', 'фирму', 'mersis', 'limited', 'адрес']),
+        "⚖️ Налоги": (['налог', 'vergi', 'kdv', 'бухгалтер', 'аудит', 'ндфл'], ['консультац', 'отчет', 'декларац', 'нужен', 'помочь']),
+        "🚀 Текнокент": (['технопарк', 'текнокент', 'teknokent', 'it'], ['льготы', 'вход', 'налоги', 'резидент', '0%']),
+        "👤 Кадры/WP": (['сотрудник', 'нанять', 'оформить', 'разрешение'], ['рабочее', 'виза', 'sgk', 'директор']),
+        "📉 Ликвидация": (['закрыть', 'ликвид', 'удалить'], ['ооо', 'фирм', 'бизнес', 'компани']),
+        "🛍️ Маркетплейсы": (['trendyol', 'hepsiburada', 'amazon', 'маркетплейс'], ['выход', 'продавать', 'открыть', 'ип', 'ооо'])
+    }
+    
+    for tag, (list_a, list_b) in topics.items():
+        # Сообщение - лид, если есть слово из А И слово из Б
+        df[f"topic_{tag}"] = df["message"].apply(
+            lambda s: 1 if any(a in s.lower() for a in list_a) and any(b in s.lower
